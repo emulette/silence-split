@@ -1,0 +1,12 @@
+target/
+.DS_Store
+
+# Credential stores. Registry and network tooling writes these into the working
+# tree, so they are ignored to keep them from ever reaching a commit.
+.env
+.git-credentials
+.netrc
+_netrc
+*.p12
+*.pem
+*.pfx

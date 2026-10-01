@@ -1,0 +1,35 @@
+[graph]
+all-features = true
+
+[advisories]
+unmaintained = "workspace"
+unsound = "all"
+ignore = []
+
+[bans]
+# Duplicate versions are reported but not fatal: upstream crates can straddle two major lines of a
+# shared dependency.
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+deny = []
+skip = []
+skip-tree = []
+
+[licenses]
+include-dev = true
+confidence-threshold = 0.93
+# Permissive licenses only: every dependency must allow closed-source,
+# commercial, royalty-free use. Add a license here only after reading its text.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

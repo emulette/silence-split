@@ -1,0 +1,34 @@
+name: Maintenance
+
+# Manual only. The advisory database is an input this repository does not control, so a push tier
+# would redden unchanged commits and an unchanged tag could stop publishing. Dispatch it before
+# tagging a release.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: maintenance
+  cancel-in-progress: true
+
+jobs:
+  advisories:
+    name: Fresh advisory database check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out exact revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install pinned cargo-deny
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-deny@0.20.2
+          fallback: none
+
+      - name: Check the workspace against today's advisories
+        run: cargo deny --locked --all-features check advisories

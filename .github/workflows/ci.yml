@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: Format, lint, test, document, and package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-deny@0.20.2
+          fallback: none
+      - name: Check dependency policy
+        run: cargo deny --locked --all-features check licenses bans sources
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: Run tests
+        run: cargo test --all-features --locked
+      - name: Build documentation with warnings denied
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --all-features --locked
+      - name: Build the crate from its package
+        run: cargo package --locked
+
+  msrv:
+    name: Minimum supported Rust version, warnings denied
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # RUSTUP_TOOLCHAIN overrides rust-toolchain.toml, which pins the current toolchain for every
+    # other job. Without it this job would check the pinned toolchain instead of the floor.
+    env:
+      RUSTUP_TOOLCHAIN: "1.85.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install the minimum toolchain
+        run: rustup toolchain install 1.85.0 --profile minimal
+      # A gate that silently runs the current compiler looks exactly like a passing MSRV check.
+      - name: Require the declared minimum toolchain
+        run: |
+          declared="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)"
+          actual="$(rustc --version | cut -d' ' -f2)"
+          case "$actual" in
+            "$declared"|"$declared".*) ;;
+            *)
+              printf '::error::MSRV gate ran rustc %s but Cargo.toml declares %s\n' \
+                "$actual" "$declared"
+              exit 1
+              ;;
+          esac
+          printf 'MSRV gate is running rustc %s\n' "$actual"
+      - name: Check every target with warnings denied
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo check --all-targets --all-features --locked
