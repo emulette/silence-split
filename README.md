@@ -10,7 +10,8 @@ the original timeline.
 - **Any sample rate.** 44.1 kHz or 48 kHz audio is analyzed as is. Frame positions are exact
   integers, so they never drift at rates where 10 ms is not a whole number of samples.
 - **Automatic threshold.** The silence threshold is derived from each file's own level
-  distribution, with hysteresis, and ignores digital silence.
+  distribution, with hysteresis, and ignores signal-free frames, including digital silence and
+  filtered DC padding.
 - **External voice activity scores.** Probabilities from a detector running at another rate, such
   as Silero VAD at 16 kHz, can replace the level analysis and are mapped to the original rate.
 - **No default dependencies**, and `no_std` with `alloc` and `libm`.
@@ -19,7 +20,7 @@ the original timeline.
 
 ```toml
 [dependencies]
-silence-split = "0.1.0"
+silence-split = "0.2.0"
 ```
 
 The minimum supported Rust version is 1.85.
@@ -45,6 +46,12 @@ fn split(pcm: &[f32], sample_rate: u32) -> Result<Vec<&[f32]>, ConfigError> {
 }
 ```
 
+Automatic detection uses the recording's relative energy distribution. It preserves steady sound
+when that distribution cannot support a separating threshold; steady background noise can be kept
+too. To remove noise at a known level, choose an absolute threshold with
+`SegmentConfig::default().threshold(Threshold::Abs(-40.0))?`, using a dBFS value appropriate for
+your recording after the detection high-pass filter. Use `Gap::Keep` to preserve all samples.
+
 Each `Piece` is a half-open range of samples per channel, flagged when it is shorter than the
 minimum or longer than the maximum, and each `Cut` says whether it fell in silence, in quiet sound,
 or was forced.
@@ -56,22 +63,52 @@ or was forced.
 - `PlanConfig::count` asks for an exact number of pieces instead of a target length. If the count
   and maximum cannot both be met on the frame grid, the planner minimizes the longest piece and
   flags pieces that exceed the maximum. With `Gap::Drop`, this check accounts for removable silence.
-- `adjust` moves cut points you already have, such as chapter marks, into nearby silence.
+- `adjust` moves cut points you already have, such as chapter marks, into nearby silence. An
+  `AdjustConfig` controls the window, weights and placement; the result maps every original input
+  point to its cut or `None` if skipped.
 - `Analysis::segments` returns the silence and sound spans, and `Analysis::trim` the range between
   the first and last sound.
-- `Analysis::from_scores` takes per-frame speech probabilities from an external detector.
-- `write_audacity_labels` writes the pieces as an Audacity label track for review.
+- `Analysis::from_scores` takes per-frame speech probabilities and a named
+  `ScoreFrames { sample_rate, hop }` timebase from an external detector.
+- `Analysis::levels` reports the floor, reference and resolved thresholds for a `SegmentConfig`,
+  or `None` for empty or entirely signal-free PCM.
+- `write_audacity_labels` writes the pieces as an Audacity label track for review, using a
+  `NonZeroU32` sample rate.
+
+```rust
+use std::{num::NonZeroU32, time::Duration};
+
+use silence_split::{
+    AdjustConfig, Analysis, Layout, ScoreFrames, SegmentConfig, adjust, write_audacity_labels,
+};
+
+let layout = Layout { sample_rate: 44_100, channels: 1 };
+let frames = ScoreFrames { sample_rate: 16_000, hop: 160 };
+let analysis = Analysis::from_scores(layout, 44_100, frames, vec![0.9; 100]).unwrap();
+let segments = SegmentConfig::default();
+let levels = analysis.levels(&segments).unwrap();
+assert_eq!(levels.on, 0.5);
+let config = AdjustConfig::new(Duration::from_millis(100));
+let result = adjust(&analysis, &segments, &[22_050, 22_050], &config);
+assert!(result.point_cuts[0].is_some());
+assert!(result.point_cuts[1].is_none()); // the duplicate was skipped
+let cut = result.point_cuts[0].unwrap();
+assert_eq!(cut.previous_end, cut.next_start); // adjust keeps all audio
+let mut labels = String::new();
+write_audacity_labels(&result.plan, NonZeroU32::new(44_100).unwrap(), &mut labels).unwrap();
+```
 
 ## How it works
 
 1. **Analysis.** Each channel is high-passed at 80 Hz for detection only, so hum and rumble do not
    read as sound. Every 10 ms hop gets one level in dBFS over a 30 ms window. Frames whose window
-   is all digital zero are left out of the level statistics and treated as silence. Samples that
-   are not finite are read as zero.
+   is all digital zero, or whose filtered mean power is at most `1e-20` (-200 dBFS), are left out
+   of the level statistics and start as silence. Samples that are not finite are read as zero.
 2. **Segmentation.** With the automatic threshold, sound starts at
    `max(floor + 4, min(floor + 6, ref − 20))` dBFS, where `floor` and `ref` are the 10th and 99th
-   percentile frame levels, and ends 3 dB lower. Silence shorter than 250 ms and sound shorter than
-   100 ms are ignored.
+   percentile frame levels. If that threshold exceeds `ref`, it is lowered to `floor` to retain
+   steady sound. Sound ends 3 dB below the resolved threshold. Silence shorter than 250 ms and sound
+   shorter than 100 ms are ignored, except that silence covering the entire input stays silent.
 3. **Planning.** Candidate cuts are every silence and the quietest point of each block of
    `min(1 s, max((max − min) / 2, max / 8))` outside them. A dynamic program over the candidates
    minimizes the cost of the cuts (a fixed cost per cut, the level at the cut and how short the
@@ -80,9 +117,18 @@ or was forced.
    equal split of flat audio, through the cost alone.
 
 Cuts fall on analysis frame boundaries, 10 ms apart by default. The planner adds frame boundaries
-when needed to meet the maximum or piece count; padding can yield to these limits. The default
-thresholds and cost weights are starting values that have not been tuned on a recorded corpus, so treat them as
-experimental and check a plan against the audio before relying on it.
+when needed to meet the maximum or piece count; padding can yield to these limits. Cut reasons use
+that effective padding, so a `Silence` cut can lie inside a sound span returned by `segments`,
+which uses the original padding. `Cut::previous_end` ends the earlier piece and `Cut::next_start`
+starts the later one; with `Drop`, the range between them is discarded.
+
+Count mode prunes predecessor ranges using cost lower bounds while preserving the same cut path
+and tie rules. Its parent table still needs about `4 × count × candidates` bytes, plus linear
+working memory; large counts can exhaust memory. With `Drop`, the target is the original span
+between the trimmed ends divided by the count, including internal silence that may be removed.
+
+The default thresholds and cost weights are starting values that have not been tuned on a recorded
+corpus, so treat them as experimental and check a plan against the audio before relying on it.
 
 ## Compared with greedy splitters
 
@@ -124,11 +170,18 @@ Use the toolchain in `rust-toolchain.toml` with rustfmt and Clippy. Dependency c
 
 ```sh
 cargo test --all-features --locked
+cargo test --no-default-features --features libm,serde --locked
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features --locked
 cargo deny --locked --all-features check licenses bans sources
 ```
+
+The fixed planning workloads in `cargo run --release --locked --example count_performance` print
+elapsed time and cut-path checksums. On the same local host, the one-hour/5,000-piece workload took
+130.09 s with 0.1.0 and 8.79 s with 0.2.0, with the same cut path. These are individual
+measurements, not latency guarantees; the worst-case search is still quadratic in the candidate
+count per row.
 
 ## License
 

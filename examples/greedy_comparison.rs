@@ -89,7 +89,7 @@ fn compare(
         let silences = raw_silences(analysis);
         let len = analysis.sample_count();
         let planned = plan(analysis, &SegmentConfig::default(), &config);
-        let cuts: Vec<u64> = planned.cuts.iter().map(|c| c.end).collect();
+        let cuts: Vec<u64> = planned.cuts.iter().map(|c| c.previous_end).collect();
         global.add(len, &cuts, &silences, min_samples);
         for (tally, rule) in [(&mut longest, Greedy::Longest), (&mut last, Greedy::Last)] {
             let cuts = greedy_cuts(len, &silences, max_samples, rule);

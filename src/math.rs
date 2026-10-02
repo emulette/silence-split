@@ -34,9 +34,11 @@ mod imp {
 
 pub(crate) use imp::*;
 
+/// Lowest meaningful mean power in a frame.
+pub(crate) const MIN_POWER: f64 = 1e-20;
+
 /// Power (mean square) to decibels, with a floor far below any real recording.
 pub(crate) fn power_to_db(power: f64) -> f64 {
-    const MIN_POWER: f64 = 1e-20;
     10.0 * log10(power.max(MIN_POWER))
 }
 

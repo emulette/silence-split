@@ -131,7 +131,9 @@ impl<'a> Context<'a> {
                     return None;
                 }
                 let first = self.leading().map_or(0, |s| s.end.saturating_sub(self.pre));
-                let last = self.trailing().map_or(n, |s| (s.start + self.tail).min(n));
+                let last = self
+                    .trailing()
+                    .map_or(n, |s| s.start.saturating_add(self.tail).min(n));
                 Some((first, last))
             }
         }
@@ -143,10 +145,29 @@ impl<'a> Context<'a> {
         w.cut + w.level * level + w.pause * (1.0 - pause)
     }
 
+    /// Inclusive silence boundaries after applying the planner's effective padding.
+    fn silence_bounds(&self, silence: &Range<usize>) -> (usize, usize) {
+        let n = self.analysis.frames();
+        let lo = if silence.start == 0 {
+            0
+        } else {
+            silence.start.saturating_add(self.tail).min(n)
+        };
+        let hi = if silence.end == n {
+            n
+        } else {
+            silence.end.saturating_sub(self.pre)
+        };
+        (lo, hi)
+    }
+
     /// A supplemental point boundary, with the same costs as the grid candidates.
     fn point(&self, k: usize) -> Candidate {
         let silence = self.silences.partition_point(|s| s.end < k);
-        let reason = if self.silences.get(silence).is_some_and(|s| s.start <= k) {
+        let reason = if self.silences.get(silence).is_some_and(|s| {
+            let (lo, hi) = self.silence_bounds(s);
+            lo <= k && k <= hi
+        }) {
             CutReason::Silence
         } else if self.level[k] <= QUIET_LEVEL {
             CutReason::Quiet
@@ -179,23 +200,12 @@ impl<'a> Context<'a> {
             gap == Gap::Keep && grid.edge_limit.is_some_and(|limit| len > limit)
         };
         let mut blocked = alloc::vec![false; n + 1];
-        let mut in_silence = alloc::vec![false; n + 1];
         let mut out = Vec::new();
         for s in &self.silences {
-            let lo = if s.start == 0 {
-                0
-            } else {
-                (s.start + self.tail).min(n)
-            };
-            let hi = if s.end == n {
-                n
-            } else {
-                s.end.saturating_sub(self.pre)
-            };
+            let (lo, hi) = self.silence_bounds(s);
             blocked[s.start..=s.end].fill(true);
             if lo <= hi && gets_grid(s) {
                 blocked[lo..=hi].fill(false);
-                in_silence[lo..=hi].fill(true);
             }
             if s.start == 0 || s.end == n {
                 continue;
@@ -241,20 +251,7 @@ impl<'a> Context<'a> {
                 _ => Some(k),
             });
             if let Some(k) = quietest {
-                let level = self.level[k];
-                let reason = if in_silence[k] {
-                    CutReason::Silence
-                } else if level <= QUIET_LEVEL {
-                    CutReason::Quiet
-                } else {
-                    CutReason::Forced
-                };
-                out.push(Candidate {
-                    left: k,
-                    right: k,
-                    cost: self.cut_cost(level, self.quiet[k]),
-                    reason,
-                });
+                out.push(self.point(k));
             }
         }
 
@@ -315,8 +312,8 @@ impl<'a> Context<'a> {
         let cuts = path[1..path.len().saturating_sub(1)]
             .iter()
             .map(|&j| Cut {
-                end: pos(nodes[j].left),
-                start: pos(nodes[j].right),
+                previous_end: pos(nodes[j].left),
+                next_start: pos(nodes[j].right),
                 reason: nodes[j].reason,
             })
             .collect();

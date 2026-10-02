@@ -15,7 +15,7 @@ pub enum ConfigError {
     ZeroChannels,
     /// The sample rate leaves no room for the 80 Hz detection high-pass filter.
     SampleRateTooLow,
-    /// The hop is zero, the window is shorter than the hop, or the hop is too long.
+    /// The hop is zero, the window is shorter than the hop, or either exceeds its sample limit.
     InvalidFrames,
     /// The hop rounds to zero samples at this sample rate.
     HopTooShort,
@@ -31,7 +31,7 @@ pub enum ConfigError {
     /// The score rate or score hop is zero, or a score frame is shorter than one sample.
     InvalidScoreFrames,
     /// A score is outside `0.0..=1.0` or not finite, a level is not finite, or scores carry
-    /// digital-zero marks.
+    /// signal-free marks.
     InvalidValue,
     /// The number of frames does not cover the stated audio length.
     FrameCountMismatch,
@@ -40,8 +40,7 @@ pub enum ConfigError {
 const ZERO_SAMPLE_RATE: &str = "sample rate must be greater than zero";
 const ZERO_CHANNELS: &str = "channel count must be greater than zero";
 const SAMPLE_RATE_TOO_LOW: &str = "sample rate must be above 160 Hz for the 80 Hz high-pass filter";
-const INVALID_FRAMES: &str =
-    "hop must be greater than zero, no longer than the window, and fit in u32 samples";
+const INVALID_FRAMES: &str = "hop must be greater than zero, no longer than the window, and fit in u32 samples; window must fit in u64 samples";
 const HOP_TOO_SHORT: &str = "hop rounds to zero samples at this sample rate";
 const INVALID_THRESHOLD: &str = "threshold must be finite, and a relative threshold non-negative";
 const INVALID_LENGTHS: &str = "lengths must satisfy min <= target <= max with a non-zero target";
@@ -51,7 +50,7 @@ const INVALID_WEIGHTS: &str =
 const INVALID_SCORE_FRAMES: &str =
     "score rate and hop must be greater than zero, with each frame at least one sample long";
 const INVALID_VALUE: &str =
-    "scores must be within 0.0..=1.0 without zero marks, and levels must be finite";
+    "scores must be within 0.0..=1.0 without signal-free marks, and levels must be finite";
 const FRAME_COUNT_MISMATCH: &str = "frame count does not cover the audio length";
 
 /// Panic message for planar input whose channel count differs from the layout.

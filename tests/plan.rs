@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use common::{Greedy, Signal, greedy_cuts, random_talk, raw_silences};
 use silence_split::{
-    Analysis, ConfigError, CutReason, Gap, Kind, Layout, Placement, Plan, PlanConfig,
-    SegmentConfig, Threshold, Weights, adjust, plan, write_audacity_labels,
+    AdjustConfig, Analysis, ConfigError, CutReason, Gap, Kind, Layout, Placement, Plan, PlanConfig,
+    ScoreFrames, SegmentConfig, Threshold, Weights, adjust, plan, write_audacity_labels,
 };
 
 const RATE: u32 = 16_000;
@@ -44,18 +44,18 @@ fn check_plan(plan: &Plan, analysis: &Analysis, config_max: u64, gap: Gap) {
         assert!(!piece.too_long);
     }
     for (i, cut) in plan.cuts.iter().enumerate() {
-        assert_eq!(plan.pieces[i].end, cut.end);
-        assert_eq!(plan.pieces[i + 1].start, cut.start);
-        assert!(cut.end <= cut.start);
-        assert_eq!(cut.end % HOP, 0, "cut on a hop boundary");
-        assert_eq!(cut.start % HOP, 0, "cut on a hop boundary");
+        assert_eq!(plan.pieces[i].end, cut.previous_end);
+        assert_eq!(plan.pieces[i + 1].start, cut.next_start);
+        assert!(cut.previous_end <= cut.next_start);
+        assert_eq!(cut.previous_end % HOP, 0, "cut on a hop boundary");
+        assert_eq!(cut.next_start % HOP, 0, "cut on a hop boundary");
     }
     match gap {
         // Joined in order, the pieces are the original audio.
         Gap::Keep => {
             assert_eq!(plan.pieces.first().map(|p| p.start), Some(0));
             assert_eq!(plan.pieces.last().map(|p| p.end), Some(len));
-            assert!(plan.cuts.iter().all(|c| c.end == c.start));
+            assert!(plan.cuts.iter().all(|c| c.previous_end == c.next_start));
         }
         // Pieces and dropped ranges joined in order are the original audio, and only silence
         // outside the padding is dropped.
@@ -77,7 +77,7 @@ fn check_plan(plan: &Plan, analysis: &Analysis, config_max: u64, gap: Gap) {
             ];
             let dropped = edges
                 .into_iter()
-                .chain(plan.cuts.iter().map(|c| (c.end, c.start)));
+                .chain(plan.cuts.iter().map(|c| (c.previous_end, c.next_start)));
             for (a, b) in dropped.filter(|(a, b)| a < b) {
                 assert!(
                     sound.iter().all(|s| s.end <= a || s.start >= b),
@@ -122,7 +122,11 @@ fn plans_beat_greedy_splitting_on_short_pieces() {
         check_plan(&plan, &analysis, 30, Gap::Keep);
         short += plan.pieces.iter().filter(|p| p.end - p.start < min).count();
         cuts += plan.cuts.len();
-        outside += plan.cuts.iter().filter(|c| !in_silence(c.end)).count();
+        outside += plan
+            .cuts
+            .iter()
+            .filter(|c| !in_silence(c.previous_end))
+            .count();
         let greedy = greedy_cuts(len, &silences, max, Greedy::Longest);
         let mut at = 0;
         for end in greedy.into_iter().chain([len]) {
@@ -215,9 +219,9 @@ fn a_pause_beats_a_stop_closure_in_the_same_block() {
     let cut = plan.cuts[0];
     assert_eq!(cut.reason, CutReason::Quiet);
     assert!(
-        cut.end >= pause && cut.end <= pause + 3200,
+        cut.previous_end >= pause && cut.previous_end <= pause + 3200,
         "cut at {} in the 200 ms pause at {pause}",
-        cut.end
+        cut.previous_end
     );
 }
 
@@ -241,7 +245,7 @@ fn silence_longer_than_max_is_cut_or_dropped() {
     );
     check_plan(&drop, &analysis, 20, Gap::Drop);
     assert_eq!(drop.pieces.len(), 2, "{drop:?}");
-    let dropped = len_secs(drop.cuts[0].end, drop.cuts[0].start);
+    let dropped = len_secs(drop.cuts[0].previous_end, drop.cuts[0].next_start);
     assert!(
         (dropped - 39.7).abs() < 0.1,
         "keeps 200 ms after and 100 ms before sound: {dropped}"
@@ -327,7 +331,7 @@ fn placement_inside_a_long_silence() {
         let config = lengths(2, 10, 12).placement(placement).unwrap();
         let plan = plan(&analysis, &SegmentConfig::default(), &config);
         assert_eq!(plan.cuts.len(), 1);
-        len_secs(0, plan.cuts[0].end)
+        len_secs(0, plan.cuts[0].previous_end)
     };
     // The cut range inside the 8–10 s pause excludes 200 ms after and 100 ms before sound.
     assert!((at(Placement::Center) - 9.05).abs() < 0.1);
@@ -350,7 +354,16 @@ fn scored(runs: &[(f32, usize)]) -> Analysis {
         sample_rate: RATE,
         channels: 1,
     };
-    Analysis::from_scores(layout, len, RATE, HOP as u32, scores).unwrap()
+    Analysis::from_scores(
+        layout,
+        len,
+        ScoreFrames {
+            sample_rate: RATE,
+            hop: HOP as u32,
+        },
+        scores,
+    )
+    .unwrap()
 }
 
 #[test]
@@ -359,7 +372,7 @@ fn quietest_placement_finds_the_quietest_stretch() {
     let analysis = scored(&[(0.9, 800), (0.2, 100), (0.05, 30), (0.2, 70), (0.9, 800)]);
     let plan = plan(&analysis, &SegmentConfig::default(), &lengths(2, 10, 12));
     assert_eq!(plan.cuts.len(), 1);
-    let cut = plan.cuts[0].end / HOP;
+    let cut = plan.cuts[0].previous_end / HOP;
     assert!((900..=930).contains(&cut), "cut at frame {cut}");
 }
 
@@ -385,7 +398,16 @@ fn padding_longer_than_a_block_does_not_force_long_pieces() {
         channels: 1,
     };
     let scores: Vec<f32> = [vec![0.0; 30], vec![1.0; 300]].concat();
-    let analysis = Analysis::from_scores(layout, 3300, 1000, 10, scores).unwrap();
+    let analysis = Analysis::from_scores(
+        layout,
+        3300,
+        ScoreFrames {
+            sample_rate: 1000,
+            hop: 10,
+        },
+        scores,
+    )
+    .unwrap();
     let segments = SegmentConfig::default()
         .threshold(Threshold::Abs(0.5))
         .unwrap()
@@ -452,7 +474,13 @@ fn empty_audio_has_no_pieces() {
         Plan::default()
     );
     assert_eq!(
-        adjust(&analysis, &SegmentConfig::default(), &[5], secs(1)),
+        adjust(
+            &analysis,
+            &SegmentConfig::default(),
+            &[5],
+            &AdjustConfig::new(secs(1))
+        )
+        .plan,
         Plan::default()
     );
     let mut silent = Signal::new(RATE, 42);
@@ -478,7 +506,13 @@ fn adjust_moves_points_into_nearby_silence() {
     let analysis = signal.analyze();
     let second = u64::from(RATE);
     let points = [pause + 2 * second, 25 * second, 0, signal.at()];
-    let plan = adjust(&analysis, &SegmentConfig::default(), &points, secs(3));
+    let plan = adjust(
+        &analysis,
+        &SegmentConfig::default(),
+        &points,
+        &AdjustConfig::new(secs(3)),
+    )
+    .plan;
     check_plan(&plan, &analysis, 60, Gap::Keep);
     assert_eq!(
         plan.cuts.len(),
@@ -488,19 +522,25 @@ fn adjust_moves_points_into_nearby_silence() {
     let first = plan.cuts[0];
     assert_eq!(first.reason, CutReason::Silence);
     assert!(
-        first.end >= pause && first.end <= pause + second,
+        first.previous_end >= pause && first.previous_end <= pause + second,
         "{first:?} into the pause at {pause}"
     );
     assert_ne!(plan.cuts[1].reason, CutReason::Silence);
-    assert!(plan.cuts[1].end.abs_diff(25 * second) <= 3 * second);
+    assert!(plan.cuts[1].previous_end.abs_diff(25 * second) <= 3 * second);
 
     // Close points keep their order: each stays on its side of the midpoint between them.
     let close = [pause - second, pause + 2 * second];
-    let plan = adjust(&analysis, &SegmentConfig::default(), &close, secs(3));
+    let plan = adjust(
+        &analysis,
+        &SegmentConfig::default(),
+        &close,
+        &AdjustConfig::new(secs(3)),
+    )
+    .plan;
     assert_eq!(plan.cuts.len(), 2, "{plan:?}");
     let mid = close[0].midpoint(close[1]);
     assert!(
-        plan.cuts[0].end < mid && mid <= plan.cuts[1].end,
+        plan.cuts[0].previous_end < mid && mid <= plan.cuts[1].previous_end,
         "{plan:?}"
     );
 
@@ -509,9 +549,10 @@ fn adjust_moves_points_into_nearby_silence() {
         &analysis,
         &SegmentConfig::default(),
         &[12_345],
-        Duration::ZERO,
-    );
-    assert_eq!(exact.cuts[0].end, 12_320);
+        &AdjustConfig::new(Duration::ZERO),
+    )
+    .plan;
+    assert_eq!(exact.cuts[0].previous_end, 12_320);
 }
 
 #[test]
@@ -520,10 +561,16 @@ fn adjust_cuts_a_long_silence_near_the_point() {
     // silence, far from its padding.
     let analysis = scored(&[(0.9, 100), (0.0, 1000), (0.9, 100)]);
     let point = 600 * HOP;
-    let plan = adjust(&analysis, &SegmentConfig::default(), &[point], secs(1));
+    let plan = adjust(
+        &analysis,
+        &SegmentConfig::default(),
+        &[point],
+        &AdjustConfig::new(secs(1)),
+    )
+    .plan;
     assert_eq!(plan.cuts.len(), 1);
     assert_eq!(plan.cuts[0].reason, CutReason::Silence);
-    assert!(plan.cuts[0].end.abs_diff(point) <= u64::from(RATE));
+    assert!(plan.cuts[0].previous_end.abs_diff(point) <= u64::from(RATE));
 }
 
 #[test]
@@ -536,7 +583,7 @@ fn audacity_labels_list_pieces_in_seconds() {
     let analysis = signal.analyze();
     let plan = plan(&analysis, &SegmentConfig::default(), &lengths(2, 10, 12));
     let mut out = String::new();
-    write_audacity_labels(&plan, RATE, &mut out).unwrap();
+    write_audacity_labels(&plan, std::num::NonZeroU32::new(RATE).unwrap(), &mut out).unwrap();
     let lines: Vec<&str> = out.lines().collect();
     assert_eq!(lines.len(), 2);
     let fields: Vec<&str> = lines[0].split('\t').collect();
@@ -569,7 +616,16 @@ fn analysis_and_plan_round_trip_through_serde() {
         sample_rate: RATE,
         channels: 1,
     };
-    let scores = Analysis::from_scores(layout, 1600, RATE, 160, vec![0.5; 10]).unwrap();
+    let scores = Analysis::from_scores(
+        layout,
+        1600,
+        ScoreFrames {
+            sample_rate: RATE,
+            hop: 160,
+        },
+        vec![0.5; 10],
+    )
+    .unwrap();
     let back: Analysis = serde_json::from_str(&serde_json::to_string(&scores).unwrap()).unwrap();
     assert_eq!(back, scores);
 }

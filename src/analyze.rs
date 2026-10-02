@@ -57,6 +57,17 @@ impl AnalyzeConfig {
     }
 }
 
+/// The detector's sample rate and hop for [`Analysis::from_scores`].
+///
+/// Construct with named fields; both are validated when the analysis is created.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScoreFrames {
+    /// Detector sample rate in Hz, which may differ from the original audio's rate.
+    pub sample_rate: u32,
+    /// Samples per score frame at the detector's sample rate.
+    pub hop: u32,
+}
+
 /// What the frame values of an [`Analysis`] measure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -71,8 +82,9 @@ pub(crate) enum Domain {
 ///
 /// Each channel is high-passed at 80 Hz for detection only, the channel powers are averaged, and
 /// every hop produces one frame level in dBFS over a window centered on that hop. Only the frame
-/// levels and digital-zero flags are kept, about 1.8 MB per hour at the default 10 ms hop. Samples
-/// that are not finite (NaN or infinite) are read as zero.
+/// levels and signal-free flags are kept, about 1.8 MB per hour at the default 10 ms hop. Samples
+/// that are not finite (NaN or infinite) are read as zero. A frame is signal-free when all raw
+/// samples are zero or its filtered mean power is at most `1e-20` (-200 dBFS).
 #[derive(Clone, Debug)]
 pub struct Analyzer {
     layout: Layout,
@@ -87,7 +99,7 @@ pub struct Analyzer {
     buffer_start: u64,
     received: u64,
     values: Vec<f32>,
-    zero: Vec<bool>,
+    no_signal: Vec<bool>,
 }
 
 impl Analyzer {
@@ -98,7 +110,8 @@ impl Analyzer {
     /// [`ConfigError::ZeroSampleRate`], [`ConfigError::ZeroChannels`],
     /// [`ConfigError::SampleRateTooLow`] if the rate is at or below 160 Hz,
     /// [`ConfigError::HopTooShort`] if the hop rounds to zero samples, or
-    /// [`ConfigError::InvalidFrames`] if the hop exceeds `u32::MAX` samples.
+    /// [`ConfigError::InvalidFrames`] if the hop exceeds `u32::MAX` samples or the window exceeds
+    /// `u64::MAX` samples.
     pub fn new(layout: Layout, config: &AnalyzeConfig) -> Result<Self, ConfigError> {
         validate_layout(layout)?;
         if f64::from(layout.sample_rate) <= 2.0 * CUTOFF_HZ {
@@ -124,7 +137,7 @@ impl Analyzer {
             buffer_start: 0,
             received: 0,
             values: Vec::new(),
-            zero: Vec::new(),
+            no_signal: Vec::new(),
         })
     }
 
@@ -185,7 +198,7 @@ impl Analyzer {
             hop: self.hop as u32,
             domain: Domain::Decibels,
             values: self.values,
-            zero: self.zero,
+            no_signal: self.no_signal,
         }
     }
 
@@ -213,7 +226,8 @@ impl Analyzer {
     }
 
     fn window_end(&self, i: u64) -> u64 {
-        i * self.hop + self.window - (self.window - self.hop) / 2
+        let ahead = self.window - (self.window - self.hop) / 2;
+        (i * self.hop).saturating_add(ahead)
     }
 
     /// Emits the next frame with its window clipped to `[0, available)`.
@@ -229,14 +243,14 @@ impl Analyzer {
             power += p;
             nonzero |= nz;
         }
-        // The filter rings on after the input stops, so a digital-zero window gets the floor level.
+        // The filter rings on after the input stops, so a signal-free window gets the floor level.
         let power = if nonzero {
             power / (to - from) as f64
         } else {
             0.0
         };
         self.values.push(math::power_to_db(power) as f32);
-        self.zero.push(!nonzero);
+        self.no_signal.push(!nonzero || power <= math::MIN_POWER);
         let next = self.window_start(i + 1).min(self.received);
         while self.buffer_start < next {
             self.buffer.pop_front();
@@ -274,15 +288,15 @@ pub struct Analysis {
     hop: u32,
     domain: Domain,
     values: Vec<f32>,
-    zero: Vec<bool>,
+    no_signal: Vec<bool>,
 }
 
 impl Analysis {
     /// Wraps per-frame speech probabilities from an external voice activity detector.
     ///
-    /// `len` is the length of the original audio in samples per channel. `hop` is the detector's
-    /// hop in samples at `score_rate`, which may differ from the original sample rate: a 16 kHz
-    /// detector with a 512-sample hop maps frame `i` to original sample
+    /// `len` is the length of the original audio in samples per channel. `frames.hop` is the
+    /// detector's hop in samples at `frames.sample_rate`, which may differ from the original
+    /// sample rate: a 16 kHz detector with a 512-sample hop maps frame `i` to original sample
     /// `floor(i · 512 · sample_rate / 16000)`. Each frame must span at least one original sample.
     /// The scores must cover the audio: the last score starts before `len`, and less than one hop
     /// may be missing at the end.
@@ -296,19 +310,18 @@ impl Analysis {
     pub fn from_scores(
         layout: Layout,
         len: u64,
-        score_rate: u32,
-        hop: u32,
+        frames: ScoreFrames,
         scores: Vec<f32>,
     ) -> Result<Self, ConfigError> {
-        let zero = alloc::vec![false; scores.len()];
+        let no_signal = alloc::vec![false; scores.len()];
         let analysis = Self {
             layout,
             len,
-            frame_rate: score_rate,
-            hop,
+            frame_rate: frames.sample_rate,
+            hop: frames.hop,
             domain: Domain::Scores,
             values: scores,
-            zero,
+            no_signal,
         };
         analysis.validate()?;
         Ok(analysis)
@@ -336,8 +349,9 @@ impl Analysis {
             Domain::Decibels => v.is_finite(),
             Domain::Scores => (0.0..=1.0).contains(v),
         };
-        let zero_scores = self.domain == Domain::Scores && self.zero.iter().any(|z| *z);
-        if !self.values.iter().all(valid) || zero_scores {
+        let marked_scores =
+            self.domain == Domain::Scores && self.no_signal.iter().any(|no_signal| *no_signal);
+        if !self.values.iter().all(valid) || marked_scores {
             return Err(ConfigError::InvalidValue);
         }
         let n = self.values.len();
@@ -347,7 +361,7 @@ impl Analysis {
         } else {
             n > 0 && self.start(n - 1) < len && len < self.start(n + 1)
         };
-        if !covered || self.zero.len() != n {
+        if !covered || self.no_signal.len() != n {
             return Err(ConfigError::FrameCountMismatch);
         }
         Ok(())
@@ -366,9 +380,9 @@ impl Analysis {
         &self.values
     }
 
-    /// Whether each frame's window is digital zero in every channel.
-    pub(crate) fn zero(&self) -> &[bool] {
-        &self.zero
+    /// Whether the raw window is all zero or its filtered mean power is at the floor.
+    pub(crate) fn no_signal(&self) -> &[bool] {
+        &self.no_signal
     }
 
     /// Unclipped original start sample of frame `i`.
@@ -440,7 +454,7 @@ struct AnalysisData {
     hop: u32,
     domain: Domain,
     values: Vec<f32>,
-    zero: Vec<bool>,
+    no_signal: Vec<bool>,
 }
 
 #[cfg(feature = "serde")]
@@ -455,7 +469,7 @@ impl TryFrom<AnalysisData> for Analysis {
             hop: d.hop,
             domain: d.domain,
             values: d.values,
-            zero: d.zero,
+            no_signal: d.no_signal,
         };
         analysis.validate()?;
         Ok(analysis)

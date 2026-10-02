@@ -3,7 +3,9 @@ mod common;
 use std::time::Duration;
 
 use common::{Rng, Signal, db};
-use silence_split::{Analysis, ConfigError, Kind, Layout, SegmentConfig, Span, Threshold};
+use silence_split::{
+    Analysis, ConfigError, Kind, Layout, ScoreFrames, SegmentConfig, Span, Threshold,
+};
 
 const NO_PADDING: Duration = Duration::ZERO;
 
@@ -225,7 +227,16 @@ fn scored(runs: &[(f32, usize)]) -> Analysis {
         sample_rate: 16_000,
         channels: 1,
     };
-    Analysis::from_scores(layout, len, 16_000, 160, scores).unwrap()
+    Analysis::from_scores(
+        layout,
+        len,
+        ScoreFrames {
+            sample_rate: 16_000,
+            hop: 160,
+        },
+        scores,
+    )
+    .unwrap()
 }
 
 fn frame(i: u64) -> u64 {

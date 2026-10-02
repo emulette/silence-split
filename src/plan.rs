@@ -22,6 +22,17 @@ pub enum Placement {
     Ratio(f32),
 }
 
+impl Placement {
+    pub(crate) fn validate(self) -> Result<(), ConfigError> {
+        if let Self::Ratio(r) = self {
+            if !(0.0..=1.0).contains(&r) {
+                return Err(ConfigError::InvalidRatio);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// What happens to the silence at a cut.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -40,7 +51,7 @@ pub enum Gap {
 /// (at least 20 dB apart), and `q` is the
 /// length of the quiet stretch around `x`. A piece of length `ℓ` costs
 /// `target · ((ℓ − target_len) / target_len)² + short · (min − ℓ) / min` when `ℓ < min`.
-/// [`adjust`] adds `|x − p| / window` for the distance from the requested point.
+/// [`crate::adjust()`] adds `|x − p| / window` for the distance from the requested point.
 ///
 /// The defaults are starting values that have not been tuned on a corpus.
 #[derive(Clone, Debug, PartialEq)]
@@ -71,6 +82,22 @@ impl Default for Weights {
             target: 1.0,
             short: 4.0,
         }
+    }
+}
+
+impl Weights {
+    pub(crate) fn validate(&self) -> Result<(), ConfigError> {
+        let w = self;
+        let valid = [w.level, w.pause, w.target, w.short]
+            .iter()
+            .all(|v| v.is_finite() && *v >= 0.0)
+            && w.cut.is_finite()
+            && w.cut > 0.0
+            && !w.pause_ref.is_zero();
+        if !valid {
+            return Err(ConfigError::InvalidWeights);
+        }
+        Ok(())
     }
 }
 
@@ -133,11 +160,7 @@ impl PlanConfig {
     ///
     /// [`ConfigError::InvalidRatio`] if a [`Placement::Ratio`] is outside `0.0..=1.0`.
     pub fn placement(mut self, placement: Placement) -> Result<Self, ConfigError> {
-        if let Placement::Ratio(r) = placement {
-            if !(0.0..=1.0).contains(&r) {
-                return Err(ConfigError::InvalidRatio);
-            }
-        }
+        placement.validate()?;
         self.placement = placement;
         Ok(self)
     }
@@ -149,16 +172,7 @@ impl PlanConfig {
     /// [`ConfigError::InvalidWeights`] if a weight is negative or not finite, the per-cut cost is
     /// zero, or `pause_ref` is zero.
     pub fn weights(mut self, weights: Weights) -> Result<Self, ConfigError> {
-        let w = &weights;
-        let valid = [w.level, w.pause, w.target, w.short]
-            .iter()
-            .all(|v| v.is_finite() && *v >= 0.0)
-            && w.cut.is_finite()
-            && w.cut > 0.0
-            && !w.pause_ref.is_zero();
-        if !valid {
-            return Err(ConfigError::InvalidWeights);
-        }
+        weights.validate()?;
         self.weights = weights;
         Ok(self)
     }
@@ -166,16 +180,17 @@ impl PlanConfig {
 
 /// A boundary between two consecutive pieces.
 ///
-/// The earlier piece ends at `end` and the later one starts at `start`. With [`Gap::Keep`] they
-/// are equal; with [`Gap::Drop`] the samples `[end, start)` are dropped.
+/// The earlier piece ends at `previous_end` and the later one starts at `next_start`. With
+/// [`Gap::Keep`] they are equal; with [`Gap::Drop`] the samples `[previous_end, next_start)` are
+/// dropped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub struct Cut {
     /// End of the earlier piece.
-    pub end: u64,
+    pub previous_end: u64,
     /// Start of the later piece.
-    pub start: u64,
+    pub next_start: u64,
     /// What the cut is in.
     pub reason: CutReason,
 }
@@ -185,7 +200,8 @@ pub struct Cut {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum CutReason {
-    /// A silence span.
+    /// A silence candidate, or a point in silence outside the planner's effective padding.
+    /// Padding may be shortened for the maximum, so this can differ from padded segments.
     Silence,
     /// Not silence, but within the quietest quarter of the level range.
     Quiet,
@@ -291,77 +307,4 @@ pub fn plan(analysis: &Analysis, segment: &SegmentConfig, config: &PlanConfig) -
         }
     }
     result
-}
-
-/// Moves each requested cut point to the best candidate within `window` of it, keeping the order
-/// of the points and all audio ([`Gap::Keep`]).
-///
-/// Each point is adjusted on its own; the pieces' lengths are not constrained. Candidates are the
-/// silence spans, points inside silence clear of its padding, and the quietest point of every
-/// block of `min(1 s, window)`. Each point takes the candidate with the lowest cut cost (default
-/// [`Weights`], [`Placement::Quietest`]) plus `|x − p| / window`, among those before the midpoints
-/// to its neighbouring points. A point with no candidate in its window stays at the nearest frame
-/// boundary as a [`CutReason::Forced`] cut. Points are sorted first; points at or beyond either
-/// end of the audio are ignored.
-#[must_use]
-pub fn adjust(
-    analysis: &Analysis,
-    segment: &SegmentConfig,
-    points: &[u64],
-    window: Duration,
-) -> Plan {
-    let weights = Weights::default();
-    let ctx = Context::new(analysis, segment, &weights, usize::MAX);
-    let n = analysis.frames();
-    if n == 0 {
-        return Plan::default();
-    }
-    let grid = Grid {
-        block: analysis
-            .frames_floor(window.min(Duration::from_secs(1)))
-            .max(1),
-        edge_limit: Some(0),
-    };
-    let candidates = ctx.candidates(Gap::Keep, Placement::Quietest, &grid, 0, n);
-    let inner = &candidates[1..candidates.len() - 1];
-    let positions: Vec<u64> = inner.iter().map(|c| analysis.position(c.left)).collect();
-    let len = analysis.sample_count();
-    let mut points: Vec<u64> = points
-        .iter()
-        .copied()
-        .filter(|p| *p > 0 && *p < len)
-        .collect();
-    points.sort_unstable();
-    points.dedup();
-
-    let reach = analysis.samples_in(window);
-    let mut chosen: Vec<Candidate> = Vec::with_capacity(points.len() + 2);
-    chosen.push(Candidate::node(0));
-    for (k, &p) in points.iter().enumerate() {
-        let lo = k.checked_sub(1).map_or(0, |i| points[i].midpoint(p));
-        let hi = points.get(k + 1).map_or(len, |next| p.midpoint(*next));
-        let from = positions.partition_point(|x| (*x as f64) < p as f64 - reach || *x < lo);
-        let to = positions.partition_point(|x| *x < hi && *x as f64 <= p as f64 + reach);
-        let best = (from..to.max(from))
-            .map(|i| {
-                let distance = positions[i].abs_diff(p) as f64;
-                let pull = if reach > 0.0 { distance / reach } else { 0.0 };
-                (inner[i].cost + pull, &inner[i])
-            })
-            .fold(None, |best: Option<(f64, &Candidate)>, (v, c)| match best {
-                Some((b, _)) if b <= v => best,
-                _ => Some((v, c)),
-            });
-        let pick = match best {
-            Some((_, c)) => c.clone(),
-            None => ctx.forced_at(p),
-        };
-        let after_previous = chosen.last().is_some_and(|c| c.left < pick.left);
-        if pick.left < n && after_previous {
-            chosen.push(pick);
-        }
-    }
-    chosen.push(Candidate::node(n));
-    let path: Vec<usize> = (0..chosen.len()).collect();
-    ctx.to_plan(&chosen, &path, 0.0, u64::MAX)
 }

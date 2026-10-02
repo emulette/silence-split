@@ -2,20 +2,22 @@
 
 > Rust library that splits long PCM audio into pieces no longer than a maximum length, cutting in
 > silence or at the quietest spot, with positions as sample indices in the original timeline.
-> Version 0.1.0. Rust 1.85+. License MIT OR Apache-2.0.
+> Version 0.2.0. Rust 1.85+. License MIT OR Apache-2.0.
 
 ## Pipeline
 
 1. `Analyzer::new(Layout { sample_rate, channels }, &AnalyzeConfig::default())?`, then
    `push_interleaved(&[S])` or `push_planar(&[&[S]])` any number of times (`S` is `i16` or `f32`),
    then `finish() -> Analysis`. Alternatively
-   `Analysis::from_scores(layout, len, score_rate, hop, scores) -> Result<Analysis, ConfigError>`.
+   `Analysis::from_scores(layout, len, ScoreFrames { sample_rate, hop }, scores)`, which returns
+   `Result<Analysis, ConfigError>`.
 2. `Analysis::segments(&SegmentConfig) -> Vec<Span>` and
    `Analysis::trim(&SegmentConfig) -> Option<Range<u64>>`. `Analysis::layout()` and
    `Analysis::sample_count()` return the original layout and length.
+   `Analysis::levels(&SegmentConfig) -> Option<Levels>` reports `floor`, `reference`, `on`, `off`.
 3. `plan(&Analysis, &SegmentConfig, &PlanConfig) -> Plan` or
-   `adjust(&Analysis, &SegmentConfig, points: &[u64], window: Duration) -> Plan`.
-4. Optionally `write_audacity_labels(&Plan, sample_rate, &mut impl core::fmt::Write)`.
+   `adjust(&Analysis, &SegmentConfig, points: &[u64], &AdjustConfig) -> AdjustResult`.
+4. Optionally `write_audacity_labels(&Plan, sample_rate: NonZeroU32, &mut impl core::fmt::Write)`.
 
 ## Positions and time
 
@@ -36,22 +38,26 @@
   `0 < hop <= window`. The window is centered on its hop and clipped at the ends of the audio.
 - Each channel is high-passed at 80 Hz (second-order Butterworth) for detection only. Channel
   powers are averaged; the frame value is `10 * log10(mean power)` in dBFS (full-scale sine = -3).
-- A frame is digital zero when every raw sample of every channel in its window is zero. Its value
-  is -200 dB, it is excluded from the level percentiles, and it starts as silence (the minimum
-  silence rule still applies).
+- A frame is signal-free when every raw sample in its window is zero, or its filtered mean power
+  is at most `1e-20`. Its value is -200 dB, it is excluded from the level percentiles, and it starts
+  as silence. This also excludes settled DC and subnormal padding. The minimum silence rule
+  still applies to individual runs, except for silence covering the whole input.
 - Samples that are not finite (NaN, infinity) are read as zero.
 - Push blocks may have any size; a partial interleaved frame is kept for the next push and dropped
   by `finish`. `push_planar` panics if the slice count differs from the channel count, the slices
   differ in length, or a partial interleaved frame is pending.
 - About 1.8 MB of frame data per hour at the default hop.
 - `Analyzer::new` errors: `ZeroSampleRate`, `ZeroChannels`, `SampleRateTooLow` (<= 160 Hz),
-  `HopTooShort` (hop rounds to 0 samples), `InvalidFrames` (hop over `u32::MAX` samples).
+  `HopTooShort` (hop rounds to 0 samples), `InvalidFrames` (hop over `u32::MAX` samples or window
+  over `u64::MAX` samples).
 
 ## External scores
 
-- `from_scores(layout, len, score_rate, hop, scores)`: `len` is the original length in samples per
-  channel; `hop` is in samples at `score_rate`; scores are speech probabilities in `0.0..=1.0`.
-- Each frame must span at least one original sample (`hop * sample_rate >= score_rate`), else
+- `from_scores(layout, len, frames: ScoreFrames, scores)`: `len` is the original length in samples
+  per channel. Construct `ScoreFrames { sample_rate, hop }` using the detector's sample rate and
+  hop at that rate; scores are speech probabilities in `0.0..=1.0`.
+- Each frame must span at least one original sample
+  (`frames.hop * layout.sample_rate >= frames.sample_rate`), else
   `InvalidScoreFrames` (also for a zero rate or hop).
 - The scores must cover the audio: the last score starts before `len`, and less than one hop may
   be missing at the end. Otherwise `FrameCountMismatch`. Other errors: `InvalidValue` (score
@@ -62,18 +68,26 @@
 - `SegmentConfig::default()`: `Threshold::Auto`, minimum silence 250 ms, minimum sound 100 ms,
   padding 100 ms before sound (`pre`) and 200 ms after (`tail`). Setters: `threshold(t)?`,
   `min_silence(d)`, `min_sound(d)`, `padding(pre, tail)`.
-- Levels: `floor` and `ref` are the 10th and 99th percentile of non-digital-zero frame values.
+- Levels: `floor` and `ref` are the 10th and 99th percentile of signal-bearing frame values.
 - `Threshold::Auto`: PCM sound starts at `on = max(floor + 4, min(floor + 6, ref - 20))` dB and
-  ends below `on - 3`; scores start at 0.5 and end below 0.35. `Abs(v)`: `on = off = v`.
+  ends below `on - 3`. When that onset exceeds `ref`, `on` is lowered to `floor` to retain steady
+  sound. Steady background noise is retained too; use an absolute threshold at a known level to
+  remove it. Scores start at 0.5 and end below 0.35. `Abs(v)`: `on = off = v`.
   `BelowRef(d)`: `on = off = ref - d`. Only `Auto` has hysteresis. `threshold` errors with
   `InvalidThreshold` for non-finite values or a negative `BelowRef`.
 - A silent frame becomes sound at `value >= on` and sound stays sound while `value >= off`. Sound
   runs shorter than the minimum sound become silence, then silence runs shorter than the minimum
-  silence become sound, also at either end of the audio.
+  silence become sound, also at either end of the audio. Silence covering the entire input is
+  never filled, even if the input is shorter than the minimum silence.
+- `levels(config)` reports the resolved values in dBFS for PCM or probabilities for external
+  scores. It returns `None` for empty input or entirely signal-free PCM. Zero-valued external
+  scores are observations and still produce levels. Levels are computed for the supplied
+  threshold, independently of the minimum durations and padding.
 - `segments` returns spans covering `[0, len)` in order. Sound spans include padding; when the
   paddings of two sounds overlap, the overlap is split in its middle (kept inside the silence) and
   the two sound spans are adjacent. `trim` returns the first padded sound start to the last padded
-  sound end, or `None` if there is no sound.
+  sound end, or `None` if there is no sound. Padding is clipped to the audio bounds even for
+  `Duration::MAX`.
 
 ## Planning
 
@@ -113,27 +127,42 @@
   raised, by binary search, to the smallest attainable longest piece. Pieces are still flagged
   against the requested maximum; fewer pieces are returned only if the available frame boundaries
   outside dropped ranges cannot support the requested count.
-- Reasons: `Silence` for silence candidates and grid points inside a silence, `Quiet` for other grid
-  points with `norm <= 0.25`, `Forced` otherwise.
+- Reasons: `Silence` for silence candidates (including overlapping padding). Grid and supplemental
+  points share one classification: `Silence` inside `[start + tail, end - pre]` with the planner's
+  effective padding, `Quiet` elsewhere if `norm <= 0.25`, `Forced` otherwise. Leading silence has
+  lower bound zero and trailing silence has upper bound the audio length. An empty padded range
+  has no silent point. Because planning can shorten padding, this need not match `segments`.
 - `Plan { pieces, cuts }`: `cuts[i]` separates `pieces[i]` and `pieces[i + 1]`;
-  `pieces[i].end == cuts[i].end`, `pieces[i + 1].start == cuts[i].start`. With `Keep`,
-  `cut.end == cut.start` and pieces cover `[0, len)`. `Piece` flags: `too_short` (below `min`),
-  `too_long` (above `max`). Empty audio gives an empty plan.
-- Count mode takes `O(count * candidates * candidates within max)` time and 4 bytes per count and
-  candidate.
+  `pieces[i].end == cuts[i].previous_end`, `pieces[i + 1].start == cuts[i].next_start`. With
+  `Keep`, `cut.previous_end == cut.next_start` and pieces cover `[0, len)`. `Piece` flags:
+  `too_short` (below `min`), `too_long` (above `max`). Empty audio gives an empty plan.
+- Count mode minimizes cut and length cost under the requested maximum, not the longest piece
+  unless the full grid cannot meet that maximum. With `Drop`, target length is the original span
+  between trimmed ends divided by count, including internal silence that may be removed.
+- Count mode uses a range-minimum tree and conservative cost lower bounds to prune predecessors.
+  The exact `f64` arithmetic order, earliest-predecessor ties and over-maximum fallback are
+  preserved. Unlike real-valued Monge optimization, it does not assume floating-point argmins are
+  monotone. Worst-case time is `O(count * candidates * (candidates within max + log candidates))`.
+  Parent storage remains about `4 * count * candidates` bytes, plus linear working memory.
+  Counts are capped by available candidates; large counts can exhaust memory and allocation
+  failure aborts rather than returning a configuration error.
 
 ## Adjust
 
-- `adjust(analysis, segment, points, window)` keeps all audio. Points are sorted and deduplicated;
-  points `<= 0` or `>= len` are ignored.
-- Candidates are the silence candidates, the quietest point of each block of `min(1 s, window)`
-  outside silences, and within every silence (clear of its padding) grid points with reason
-  `Silence`.
-- Each point `p` picks, among candidates within `window` of it and before the midpoints to its
-  neighbours, the lowest `cut cost + |x - p| / window` with default weights and
-  `Placement::Quietest`.
-- A point without candidates becomes a `Forced` cut at the nearest frame boundary. Cuts at the
-  same boundary as the previous one or at either end are skipped. Piece flags are always false.
+- `AdjustConfig::new(window)` sets a search window with default `Weights` and `Placement::Quietest`.
+  `weights(w)?` uses the same validation as `PlanConfig::weights`; `placement(p)?` rejects invalid
+  ratios. Length weights are unused; distance weight is fixed at one. Zero window is allowed.
+- `adjust(analysis, segment, points, config)` returns `AdjustResult { plan, point_cuts }`.
+  `plan` keeps all audio and its piece flags are false. `point_cuts: Vec<Option<Cut>>` has one
+  entry per original input, in the original order. `None` means a point was at/beyond an endpoint,
+  duplicated another input, or snapped onto an endpoint or an already selected boundary.
+  The earliest original input owns the result for duplicate positions.
+- Internally, points are sorted and deduplicated. Candidates are silence candidates using the
+  configured placement, the quietest point of each block of `min(1 s, window)` outside silences,
+  and points inside silence clear of its padding. No padding cap is applied.
+- Each point picks the lowest `cut cost + |x - p| / window` among candidates within its window and
+  before the midpoints to neighbouring points. If there is no candidate, it snaps to the nearest
+  frame boundary with reason `Forced`. The result mapping is retained even for skipped points.
 
 ## Features
 
@@ -141,6 +170,10 @@
   (`Serialize`/`Deserialize` for `Analysis`, `Layout`, `Plan`, `Piece`, `Cut`, `CutReason`, `Span`,
   `Kind`; deserializing `Analysis` validates it and fails with the matching `ConfigError`
   message).
+- The serialized format is compatible only within the same minor version. In 0.2, `Analysis`
+  stores `no_signal` instead of `zero`, and `Cut` stores `previous_end`/`next_start` instead of
+  `end`/`start`. Recreate 0.1 analyses from the original input and regenerate plans; there is no
+  legacy reader. Configurations, `Levels` and `AdjustResult` are not serialized.
 
 ## Non-goals
 

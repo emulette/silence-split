@@ -50,6 +50,7 @@ extern crate std;
 #[cfg(not(any(feature = "std", feature = "libm")))]
 compile_error!("silence-split needs the `std` or the `libm` feature");
 
+mod adjust;
 mod analyze;
 mod candidates;
 mod dp;
@@ -61,12 +62,13 @@ mod plan;
 mod sample;
 mod segment;
 
-pub use analyze::{Analysis, AnalyzeConfig, Analyzer};
+pub use adjust::{AdjustConfig, AdjustResult, adjust};
+pub use analyze::{Analysis, AnalyzeConfig, Analyzer, ScoreFrames};
 pub use errors::ConfigError;
 pub use labels::write_audacity_labels;
-pub use plan::{Cut, CutReason, Gap, Piece, Placement, Plan, PlanConfig, Weights, adjust, plan};
+pub use plan::{Cut, CutReason, Gap, Piece, Placement, Plan, PlanConfig, Weights, plan};
 pub use sample::{Layout, Sample};
-pub use segment::{Kind, SegmentConfig, Span, Threshold};
+pub use segment::{Kind, Levels, SegmentConfig, Span, Threshold};
 
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]

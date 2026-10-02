@@ -84,7 +84,9 @@ jobs:
           persist-credentials: false
 
       - name: Install the pinned toolchain
-        run: rustup show
+        run: |
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal --component clippy --component rustfmt
 
       # Exchanges this job's OIDC identity for a token that expires in 30 minutes and is revoked
       # when the job ends, so no registry credential is stored in the repository.

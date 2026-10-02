@@ -1,4 +1,4 @@
-use silence_split::{Analysis, Gap, Layout, PlanConfig, SegmentConfig, plan};
+use silence_split::{Analysis, Gap, Layout, PlanConfig, ScoreFrames, SegmentConfig, plan};
 use std::{num::NonZeroUsize, time::Duration};
 
 fn ms(value: u64) -> Duration {
@@ -15,8 +15,10 @@ fn scored(hop: u32, runs: &[(f32, usize)]) -> Analysis {
             channels: 1,
         },
         scores.len() as u64 * u64::from(hop),
-        1000,
-        hop,
+        ScoreFrames {
+            sample_rate: 1000,
+            hop,
+        },
         scores,
     )
     .unwrap()
@@ -46,7 +48,7 @@ fn exact_two_thirty_second_pieces_are_feasible() {
     let result = plan(&input, &SegmentConfig::default(), &cfg);
     assert_eq!(result.pieces.len(), 2);
     assert!(result.pieces.iter().all(|p| !p.too_long), "{result:?}");
-    assert_eq!(result.cuts[0].end, 30_000);
+    assert_eq!(result.cuts[0].previous_end, 30_000);
 }
 
 #[test]
@@ -91,8 +93,10 @@ fn count_feasibility_matches_all_frame_partitions_at_a_fractional_rate() {
             channels: 1,
         },
         len,
-        16_000,
-        512,
+        ScoreFrames {
+            sample_rate: 16_000,
+            hop: 512,
+        },
         vec![0.9, 0.9, 0.0, 0.0, 0.9, 0.9, 0.0, 0.9, 0.9],
     )
     .unwrap();
@@ -133,7 +137,10 @@ fn count_feasibility_matches_all_frame_partitions_at_a_fractional_rate() {
                     assert_eq!(piece.too_long, piece.end - piece.start > limit);
                 }
                 for cut in &result.cuts {
-                    assert!(positions.contains(&(cut.end, cut.start)), "{cut:?}");
+                    assert!(
+                        positions.contains(&(cut.previous_end, cut.next_start)),
+                        "{cut:?}"
+                    );
                 }
             }
         }

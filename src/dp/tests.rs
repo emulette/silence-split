@@ -1,0 +1,235 @@
+use super::*;
+
+/// Deterministic xorshift for test inputs.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+}
+
+fn path_cost(
+    path: &[usize],
+    left: &[u64],
+    right: &[u64],
+    cut: &[f64],
+    l: &Lengths<'_>,
+) -> Option<f64> {
+    let mut total = 0.0;
+    for w in path.windows(2) {
+        let len = left[w[1]] - right[w[0]];
+        if len > l.max {
+            return None;
+        }
+        total += l.cost(len);
+    }
+    Some(total + path[1..path.len() - 1].iter().map(|j| cut[*j]).sum::<f64>())
+}
+
+/// Cheapest cost over every subset of inner nodes, optionally of a fixed piece count.
+fn exhaustive(
+    left: &[u64],
+    right: &[u64],
+    cut: &[f64],
+    l: &Lengths<'_>,
+    count: Option<usize>,
+) -> Option<f64> {
+    let inner = left.len() - 2;
+    (0u32..1 << inner)
+        .filter(|mask| count.is_none_or(|c| mask.count_ones() as usize + 1 == c))
+        .filter_map(|mask| {
+            let mut path = alloc::vec![0];
+            path.extend((0..inner).filter(|b| mask & (1 << b) != 0).map(|b| b + 1));
+            path.push(inner + 1);
+            path_cost(&path, left, right, cut, l)
+        })
+        .min_by(f64::total_cmp)
+}
+
+fn random_nodes(rng: &mut Rng) -> (Vec<u64>, Vec<u64>, Vec<f64>) {
+    let nodes = 3 + (rng.next() % 10) as usize;
+    let (mut left, mut right, mut cut) = (Vec::new(), Vec::new(), Vec::new());
+    let mut at = 0;
+    for i in 0..nodes {
+        at += 1 + rng.next() % 40;
+        let drop = if i == 0 || i + 1 == nodes {
+            0
+        } else {
+            rng.next() % 3 * (rng.next() % 5)
+        };
+        left.push(at);
+        right.push(at + drop);
+        at += drop;
+        cut.push((rng.next() % 1000) as f64 / 500.0 + 0.1);
+    }
+    (left, right, cut)
+}
+
+#[test]
+fn matches_exhaustive_search() {
+    let weights = Weights::default();
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    for _ in 0..500 {
+        let (left, right, cut) = random_nodes(&mut rng);
+        let min = (rng.next() % 30) as f64;
+        let target = min + 1.0 + (rng.next() % 40) as f64;
+        let max = target as u64 + rng.next() % 60;
+        let l = Lengths {
+            min,
+            target,
+            max,
+            weights: &weights,
+        };
+
+        if let Some(best) = exhaustive(&left, &right, &cut, &l, None) {
+            let path = solve(&left, &right, &cut, &l);
+            let got = path_cost(&path, &left, &right, &cut, &l).expect("within max");
+            assert!((got - best).abs() < 1e-9, "dp {got} vs exhaustive {best}");
+        }
+        let count = 1 + (rng.next() % 4) as usize;
+        if let Some(best) = exhaustive(&left, &right, &cut, &l, Some(count)) {
+            let path = solve_count(&left, &right, &cut, &l, count);
+            assert_eq!(path.len(), count + 1);
+            let got = path_cost(&path, &left, &right, &cut, &l).expect("within max");
+            assert!(
+                (got - best).abs() < 1e-9,
+                "count dp {got} vs exhaustive {best}"
+            );
+        }
+    }
+}
+
+#[test]
+fn ties_keep_fewer_cuts() {
+    let weights = Weights {
+        target: 0.0,
+        ..Weights::default()
+    };
+    let l = Lengths {
+        min: 0.0,
+        target: 10.0,
+        max: 100,
+        weights: &weights,
+    };
+    let path = solve(&[0, 50, 100], &[0, 50, 100], &[0.0, 0.0, 0.0], &l);
+    assert_eq!(path, [0, 2]);
+}
+
+#[test]
+fn without_a_predecessor_within_max_the_nearest_node_is_used() {
+    let weights = Weights::default();
+    let l = Lengths {
+        min: 0.0,
+        target: 10.0,
+        max: 10,
+        weights: &weights,
+    };
+    let nodes = [0, 20, 40, 41];
+    let cut = [0.0, 1.0, 1.0, 0.0];
+    assert_eq!(solve(&nodes, &nodes, &cut, &l), [0, 1, 2, 3]);
+    assert_eq!(solve_count(&nodes, &nodes, &cut, &l, 2), [0, 2, 3]);
+    assert_eq!(solve_count(&nodes, &nodes, &cut, &l, 9), [0, 1, 2, 3]);
+}
+
+/// The cheapest path of exactly `count` pieces, or of as many as there are nodes to allow, with
+/// the same rule for nodes without a predecessor within `max`.
+///
+/// Time is `O(count · nodes · nodes within max)`; memory is four bytes per count and node.
+fn legacy_count(
+    left: &[u64],
+    right: &[u64],
+    cut: &[f64],
+    lengths: &Lengths<'_>,
+    count: usize,
+) -> Vec<usize> {
+    let m = left.len() - 1;
+    let count = count.min(m);
+    let mut previous = alloc::vec![None; m + 1];
+    previous[0] = Some(Score { over: 0, cost: 0.0 });
+    let mut parent: Vec<Vec<u32>> = Vec::with_capacity(count + 1);
+    parent.push(Vec::new());
+    for k in 1..=count {
+        let mut current = alloc::vec![None; m + 1];
+        let mut row = alloc::vec![0u32; m + 1];
+        for j in k..=m {
+            // After one piece only the start node is reachable; after more, every node from k - 1.
+            let nearest = if k == 1 { 0 } else { j - 1 };
+            let found = best_predecessor(j, k - 1, nearest, left, right, lengths, |i| previous[i]);
+            if let Some((s, i)) = found {
+                let cost = s.cost + if j < m { cut[j] } else { 0.0 };
+                current[j] = Some(Score { over: s.over, cost });
+                row[j] = i as u32;
+            }
+        }
+        parent.push(row);
+        previous = current;
+    }
+    let mut k = count;
+    backtrack(m, |j| {
+        let i = parent[k][j] as usize;
+        k -= 1;
+        i
+    })
+}
+
+#[test]
+fn count_paths_match_legacy_with_ties_and_overlong_frames() {
+    let mut rng = Rng(0x9876_5432_10ab_cdef);
+    for trial in 0..20_000 {
+        let (left, right, mut cut) = random_nodes(&mut rng);
+        let weights = Weights {
+            target: [0.0, 0.01, 1.0, 100.0][(rng.next() % 4) as usize],
+            short: [0.0, 0.1, 4.0, 100.0][(rng.next() % 4) as usize],
+            ..Weights::default()
+        };
+        if trial % 3 == 0 {
+            cut.fill(0.0);
+        }
+        let l = Lengths {
+            min: (rng.next() % 100) as f64,
+            target: 1.0 + (rng.next() % 100) as f64,
+            max: rng.next() % 200,
+            weights: &weights,
+        };
+        for count in 1..=left.len() + 1 {
+            assert_eq!(
+                solve_count(&left, &right, &cut, &l, count),
+                legacy_count(&left, &right, &cut, &l, count),
+                "trial={trial}, count={count}, left={left:?}, right={right:?}, cut={cut:?}, min={}, target={}, max={}, weights={weights:?}",
+                l.min,
+                l.target,
+                l.max
+            );
+        }
+    }
+}
+
+#[test]
+fn count_paths_preserve_float_rounding_at_extreme_scales() {
+    let mut rng = Rng(0x2154_1248_6666_ffff);
+    for trial in 0..2000 {
+        let (left, right, cut) = random_nodes(&mut rng);
+        let weights = Weights {
+            target: [0.0, 1e-200, 1e200, f64::MAX][(rng.next() % 4) as usize],
+            short: [0.0, 1e-200, 1e200, f64::MAX][(rng.next() % 4) as usize],
+            ..Weights::default()
+        };
+        let l = Lengths {
+            min: (rng.next() % 100) as f64,
+            target: [1e-19, 0.5, 1.0, 100.0][(rng.next() % 4) as usize],
+            max: rng.next() % 200,
+            weights: &weights,
+        };
+        for count in 1..=left.len() {
+            assert_eq!(
+                solve_count(&left, &right, &cut, &l, count),
+                legacy_count(&left, &right, &cut, &l, count),
+                "trial={trial}, count={count}"
+            );
+        }
+    }
+}

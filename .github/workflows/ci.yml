@@ -27,7 +27,9 @@ jobs:
         with:
           persist-credentials: false
       - name: Install the pinned toolchain
-        run: rustup show
+        run: |
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal --component clippy --component rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
@@ -41,12 +43,34 @@ jobs:
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - name: Run tests
         run: cargo test --all-features --locked
+      - name: Test without the standard library
+        run: cargo test --no-default-features --features libm,serde --locked
       - name: Build documentation with warnings denied
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps --all-features --locked
       - name: Build the crate from its package
         run: cargo package --locked
+
+  i686:
+    name: Test on a 32-bit target
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain with the 32-bit target
+        run: |
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal --component clippy --component rustfmt \
+            --target i686-unknown-linux-gnu
+      - name: Install the 32-bit C runtime for linking
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends gcc-multilib
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # usize is 32 bits here, so index arithmetic that only overflows below 64 bits is exercised.
+      - name: Run tests
+        run: cargo test --all-features --locked --target i686-unknown-linux-gnu
 
   msrv:
     name: Minimum supported Rust version, warnings denied

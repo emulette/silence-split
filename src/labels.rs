@@ -1,6 +1,6 @@
 //! Audacity label track export.
 
-use core::fmt;
+use core::{fmt, num::NonZeroU32};
 
 use crate::plan::Plan;
 
@@ -13,10 +13,10 @@ use crate::plan::Plan;
 /// Any error from the writer.
 pub fn write_audacity_labels(
     plan: &Plan,
-    sample_rate: u32,
+    sample_rate: NonZeroU32,
     out: &mut impl fmt::Write,
 ) -> fmt::Result {
-    let secs = |sample: u64| sample as f64 / f64::from(sample_rate);
+    let secs = |sample: u64| sample as f64 / f64::from(sample_rate.get());
     for (i, piece) in plan.pieces.iter().enumerate() {
         writeln!(
             out,

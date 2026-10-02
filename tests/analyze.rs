@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use common::Signal;
 use silence_split::{
-    Analysis, AnalyzeConfig, Analyzer, ConfigError, Kind, Layout, PlanConfig, SegmentConfig, plan,
+    Analysis, AnalyzeConfig, Analyzer, ConfigError, Kind, Layout, PlanConfig, ScoreFrames,
+    SegmentConfig, plan,
 };
 
 fn layout(sample_rate: u32, channels: u16) -> Layout {
@@ -122,7 +123,16 @@ fn three_hours_of_scores_map_exactly_to_the_original_rate() {
     let mut scores = vec![0.9; frames];
     let pause = frames - 1000;
     scores[pause..pause + 100].fill(0.0);
-    let analysis = Analysis::from_scores(layout(44_100, 1), len, 16_000, 512, scores).unwrap();
+    let analysis = Analysis::from_scores(
+        layout(44_100, 1),
+        len,
+        ScoreFrames {
+            sample_rate: 16_000,
+            hop: 512,
+        },
+        scores,
+    )
+    .unwrap();
     let spans =
         analysis.segments(&SegmentConfig::default().padding(Duration::ZERO, Duration::ZERO));
     let at = |i: u64| i * 512 * 44_100 / 16_000;
@@ -141,7 +151,7 @@ fn non_finite_samples_read_as_zero() {
     signal.tone(5.0, 440.0, -12.0);
     signal.samples[32_000] = f32::NAN;
     signal.samples[48_000] = f32::INFINITY;
-    // A steady tone is all at the noise floor for the automatic threshold, so use a fixed one.
+    // A fixed threshold isolates handling of non-finite samples from automatic level estimation.
     let config = SegmentConfig::default()
         .threshold(silence_split::Threshold::Abs(-40.0))
         .unwrap();
@@ -221,7 +231,16 @@ fn scores_map_to_the_original_rate_exactly() {
     let scores: Vec<f32> = (0..frames)
         .map(|i| if (i / 50) % 2 == 0 { 0.9 } else { 0.05 })
         .collect();
-    let analysis = Analysis::from_scores(layout(44_100, 1), len, 16_000, 512, scores).unwrap();
+    let analysis = Analysis::from_scores(
+        layout(44_100, 1),
+        len,
+        ScoreFrames {
+            sample_rate: 16_000,
+            hop: 512,
+        },
+        scores,
+    )
+    .unwrap();
     let spans =
         analysis.segments(&SegmentConfig::default().padding(Duration::ZERO, Duration::ZERO));
     let expected = |i: u64| i * 512 * 44_100 / 16_000;
@@ -237,8 +256,12 @@ fn scores_map_to_the_original_rate_exactly() {
     .unwrap();
     let plan = plan(&analysis, &SegmentConfig::default(), &config);
     for cut in &plan.cuts {
-        let frame = (cut.end * 16_000).div_ceil(512 * 44_100);
-        assert_eq!(cut.end, expected(frame), "cut on a detector frame boundary");
+        let frame = (cut.previous_end * 16_000).div_ceil(512 * 44_100);
+        assert_eq!(
+            cut.previous_end,
+            expected(frame),
+            "cut on a detector frame boundary"
+        );
     }
 }
 
@@ -246,31 +269,100 @@ fn scores_map_to_the_original_rate_exactly() {
 fn scores_are_validated() {
     let l = layout(44_100, 1);
     assert_eq!(
-        Analysis::from_scores(l, 44_100, 0, 512, vec![0.5]).err(),
+        Analysis::from_scores(
+            l,
+            44_100,
+            ScoreFrames {
+                sample_rate: 0,
+                hop: 512
+            },
+            vec![0.5]
+        )
+        .err(),
         Some(ConfigError::InvalidScoreFrames)
     );
     assert_eq!(
-        Analysis::from_scores(l, 1411, 16_000, 512, vec![1.5]).err(),
+        Analysis::from_scores(
+            l,
+            1411,
+            ScoreFrames {
+                sample_rate: 16_000,
+                hop: 512
+            },
+            vec![1.5]
+        )
+        .err(),
         Some(ConfigError::InvalidValue)
     );
     assert_eq!(
-        Analysis::from_scores(l, 1411, 16_000, 512, vec![f32::NAN]).err(),
+        Analysis::from_scores(
+            l,
+            1411,
+            ScoreFrames {
+                sample_rate: 16_000,
+                hop: 512
+            },
+            vec![f32::NAN]
+        )
+        .err(),
         Some(ConfigError::InvalidValue)
     );
     // Frame 31 starts at sample 43 747 and frame 32 at 44 697: less than a hop may be missing.
     let scores = |n| vec![0.5; n];
-    let with = |len, n| Analysis::from_scores(l, len, 16_000, 512, scores(n)).err();
+    let with = |len, n| {
+        Analysis::from_scores(
+            l,
+            len,
+            ScoreFrames {
+                sample_rate: 16_000,
+                hop: 512,
+            },
+            scores(n),
+        )
+        .err()
+    };
     assert_eq!(with(44_100, 32), None);
     assert_eq!(with(44_100, 31), None);
     assert_eq!(with(44_100, 30), Some(ConfigError::FrameCountMismatch));
     assert_eq!(with(44_100, 33), Some(ConfigError::FrameCountMismatch));
     // A whole missing hop is not allowed.
     let same_rate = layout(16_000, 1);
-    let exact = |n| Analysis::from_scores(same_rate, 1024, 16_000, 512, scores(n)).err();
+    let exact = |n| {
+        Analysis::from_scores(
+            same_rate,
+            1024,
+            ScoreFrames {
+                sample_rate: 16_000,
+                hop: 512,
+            },
+            scores(n),
+        )
+        .err()
+    };
     assert_eq!(exact(2), None);
     assert_eq!(exact(1), Some(ConfigError::FrameCountMismatch));
     // Frames shorter than one original sample.
-    let short = Analysis::from_scores(layout(8_000, 1), 4, 16_000, 1, scores(8)).err();
+    let short = Analysis::from_scores(
+        layout(8_000, 1),
+        4,
+        ScoreFrames {
+            sample_rate: 16_000,
+            hop: 1,
+        },
+        scores(8),
+    )
+    .err();
     assert_eq!(short, Some(ConfigError::InvalidScoreFrames));
-    assert!(Analysis::from_scores(l, 0, 16_000, 512, Vec::new()).is_ok());
+    assert!(
+        Analysis::from_scores(
+            l,
+            0,
+            ScoreFrames {
+                sample_rate: 16_000,
+                hop: 512
+            },
+            Vec::new()
+        )
+        .is_ok()
+    );
 }
