@@ -30,7 +30,7 @@ jobs:
         run: |
           toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
           rustup toolchain install "$toolchain" --profile minimal --component clippy --component rustfmt
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
         with:
           tool: cargo-deny@0.20.2
@@ -67,7 +67,7 @@ jobs:
             --target i686-unknown-linux-gnu
       - name: Install the 32-bit C runtime for linking
         run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends gcc-multilib
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # usize is 32 bits here, so index arithmetic that only overflows below 64 bits is exercised.
       - name: Run tests
         run: cargo test --all-features --locked --target i686-unknown-linux-gnu
